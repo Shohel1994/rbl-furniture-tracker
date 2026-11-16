@@ -73,6 +73,7 @@ import hmac
 import io
 import re
 from datetime import date, datetime
+from urllib.parse import parse_qs, urlparse
 from xml.sax.saxutils import escape
 
 import pandas as pd
@@ -115,6 +116,15 @@ CONDITION_TO_STATUS = {"Good": "Active", "Fair": "Active", "Needs Repair": "Repa
 
 DEFAULT_PREFIX = "RBL-FURN"
 QR_ID_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9_\-]{2,49}$")
+
+# Hides the sidebar / menus for staff who arrive by scanning a QR sticker
+FIELD_MODE_CSS = """
+<style>
+[data-testid="stSidebar"], [data-testid="collapsedControl"],
+[data-testid="stSidebarCollapsedControl"], [data-testid="stToolbar"],
+#MainMenu, footer {display: none !important;}
+</style>
+"""
 
 # Slightly tighter padding for phones
 st.markdown(
@@ -222,8 +232,19 @@ def normalize_code(raw: str) -> str:
     return (raw or "").strip().upper()
 
 
+def extract_code(raw: str) -> str:
+    """Accepts a plain ID ('RBL-FURN-0001') or a QR link ('https://app/?id=RBL-FURN-0001')."""
+    raw = (raw or "").strip()
+    if "://" in raw:
+        raw = (parse_qs(urlparse(raw).query).get("id") or [""])[0]
+    return normalize_code(raw)
+
+
 def finish_and_return_to_scanner(message: str) -> None:
     """Show a flash message on the next run and reset the scanner for the next item."""
+    if st.session_state.get("field_mode"):  # staff opened the page from a QR sticker
+        st.session_state["field_done"] = message
+        st.rerun()
     st.session_state["flash"] = message
     st.session_state["active_code"] = None
     st.session_state["scan_nonce"] += 1  # new widget key -> fresh scanner
@@ -237,7 +258,7 @@ def reset_scanner() -> None:
 
 def set_active_code(raw: str) -> None:
     """Validate a scanned / typed code and make it the active one."""
-    code = normalize_code(raw)
+    code = extract_code(raw)
     if not QR_ID_PATTERN.match(code):
         st.error(
             f"'{raw}' does not look like one of our asset QR codes "
@@ -409,6 +430,40 @@ def render_update_form(asset: dict, inspector: str) -> None:
             st.dataframe(hist, hide_index=True)
 
 
+def show_asset_flow(code: str, inspector: str) -> None:
+    """Look the code up and show the register form (new) or the update form (existing)."""
+    try:
+        found = get_supabase().table("assets").select("*").eq("qr_code_id", code).limit(1).execute().data
+    except Exception as exc:
+        st.error(f"Database error: {exc}")
+        return
+    if found:
+        render_update_form(found[0], inspector)
+    else:
+        render_register_form(code, inspector)
+
+
+def page_field(raw_code: str) -> None:
+    """Staff view opened from a QR link: ONLY the form for that one item, nothing else."""
+    st.title("🪑 Furniture Check")
+    if st.session_state.get("field_done"):
+        st.success(st.session_state["field_done"])
+        st.info("Done! To record another item, scan its QR code with your phone camera.")
+        return
+
+    code = extract_code(raw_code)
+    if not QR_ID_PATTERN.match(code):
+        st.error("This QR code is not valid.")
+        return
+
+    inspector = st.text_input("Your name", key="inspector", placeholder="Type your name and press Enter")
+    if not inspector.strip():
+        st.warning("Please enter your name to continue.")
+        return
+    st.caption(f"Scanned item: **{code}**")
+    show_asset_flow(code, inspector)
+
+
 def page_scan(inspector: str) -> None:
     st.header("📷 Scan & Register / Update")
     ss = st.session_state
@@ -434,17 +489,7 @@ def page_scan(inspector: str) -> None:
     # ---- Step 2: register or update ------------------------------------------
     code = ss["active_code"]
     st.button("🔄 Scan another item", on_click=reset_scanner)
-
-    try:
-        found = get_supabase().table("assets").select("*").eq("qr_code_id", code).limit(1).execute().data
-    except Exception as exc:
-        st.error(f"Database error: {exc}")
-        return
-
-    if found:
-        render_update_form(found[0], inspector)
-    else:
-        render_register_form(code, inspector)
+    show_asset_flow(code, inspector)
 
 
 # --------------------------------------------------------------------------- #
@@ -617,7 +662,20 @@ def qr_png_bytes(text: str) -> bytes:
     return buf.getvalue()
 
 
-def build_qr_sheet_pdf(prefix: str, start: int, end: int, cols: int) -> bytes:
+def get_app_url() -> str:
+    """Public URL of this app, from secrets  [app] url = "https://..."  (optional)."""
+    try:
+        return str(st.secrets["app"]["url"]).strip()
+    except Exception:
+        return ""
+
+
+def qr_content(base_url: str, code: str) -> str:
+    """What is stored inside the QR: a link that opens the form for this exact asset."""
+    return f"{base_url.rstrip('/')}/?id={code}" if base_url else code
+
+
+def build_qr_sheet_pdf(prefix: str, start: int, end: int, cols: int, base_url: str) -> bytes:
     """A4 grid of QR labels with the ID printed underneath each code."""
     page_w, page_h = A4
     margin = 10 * mm
@@ -648,7 +706,7 @@ def build_qr_sheet_pdf(prefix: str, start: int, end: int, cols: int) -> bytes:
         c.setDash()
 
         c.drawImage(
-            ImageReader(io.BytesIO(qr_png_bytes(code))),
+            ImageReader(io.BytesIO(qr_png_bytes(qr_content(base_url, code)))),
             x0 + (cell_w - qr_size) / 2, y_top - 3 * mm - qr_size, qr_size, qr_size,
         )
         c.setFillColor(colors.black)
@@ -661,10 +719,16 @@ def build_qr_sheet_pdf(prefix: str, start: int, end: int, cols: int) -> bytes:
 
 def page_qr_generator() -> None:
     st.header("🏷️ QR Code Generator (Admin)")
-    if not admin_gate():
-        return
-
-    st.caption("Generates blank QR labels that contain only the ID. Details are added later by scanning.")
+    st.caption(
+        "Each QR contains a link to this app (with the asset ID). Staff scan it with the normal "
+        "phone camera and get only the form for that item."
+    )
+    base_url = st.text_input(
+        "App URL", value=get_app_url(), placeholder="https://your-app.streamlit.app",
+        help="The public address of this deployed app. You can also set it in secrets as [app] url.",
+    ).strip()
+    if not base_url:
+        st.warning("Enter the app URL first, otherwise the QR will contain only the ID and phone cameras can't open it.")
     c1, c2, c3, c4 = st.columns(4)
     prefix = c1.text_input("Prefix", value=DEFAULT_PREFIX).strip().upper()
     start = c2.number_input("From number", min_value=1, value=1, step=1)
@@ -684,22 +748,19 @@ def page_qr_generator() -> None:
 
     first, last = f"{prefix}-{int(start):04d}", f"{prefix}-{int(end):04d}"
     st.write(f"**{count}** labels: `{first}` → `{last}`")
-    st.image(qr_png_bytes(first), caption=f"Preview: {first}", width=150)
+    st.image(qr_png_bytes(qr_content(base_url, first)), caption=f"Preview: {first}", width=150)
+    st.caption(f"QR content: {qr_content(base_url, first)}")
 
     if st.button("Generate PDF", type="primary"):
         with st.spinner("Building PDF..."):
             st.session_state["qr_pdf"] = (
-                build_qr_sheet_pdf(prefix, int(start), int(end), cols),
+                build_qr_sheet_pdf(prefix, int(start), int(end), cols, base_url),
                 f"qr_labels_{prefix}_{int(start):04d}-{int(end):04d}.pdf",
             )
     if "qr_pdf" in st.session_state:
         data, name = st.session_state["qr_pdf"]
         st.download_button("⬇️ Download printable PDF", data=data, file_name=name, mime="application/pdf")
 
-    if st.sidebar.button("🔒 Lock admin tools"):
-        st.session_state["is_admin"] = False
-        st.session_state.pop("qr_pdf", None)
-        st.rerun()
 
 
 # --------------------------------------------------------------------------- #
@@ -712,12 +773,31 @@ def main() -> None:
     ss.setdefault("active_code", None)
     ss.setdefault("scan_nonce", 0)
 
+    # ---- Staff mode: opened from a QR sticker (?id=...) -> only that item's form ----
+    qr_id = st.query_params.get("id")
+    if qr_id:
+        ss["field_mode"] = True
+        st.markdown(FIELD_MODE_CSS, unsafe_allow_html=True)
+        page_field(qr_id)
+        return
+    ss["field_mode"] = False
+
+    # ---- Admin mode: the plain app address requires the admin password ----
+    if not ss.get("is_admin"):
+        st.title("🔐 Admin login")
+        admin_gate()
+        return
+
     st.sidebar.title("🪑 Furniture Tracker")
     page = st.sidebar.radio(
         "Navigate",
-        ["Scan & Register / Update", "Inventory & Dashboard", "QR Code Generator"],
+        ["Inventory & Dashboard", "QR Code Generator", "Scan & Register / Update"],
     )
     inspector = st.sidebar.text_input("Inspector name", key="inspector", placeholder="Your name")
+    if st.sidebar.button("🔒 Log out"):
+        ss["is_admin"] = False
+        ss.pop("qr_pdf", None)
+        st.rerun()
 
     if page == "Scan & Register / Update":
         page_scan(inspector)
