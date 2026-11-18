@@ -57,6 +57,17 @@ SETUP
    create index if not exists idx_logs_qr_time
      on public.inspection_logs (qr_code_id, "timestamp" desc);
 
+   -- Staff PINs (managed from the admin page 'Staff & PINs'; PINs are stored hashed)
+   create table if not exists public.staff_users (
+     id         uuid primary key default gen_random_uuid(),
+     name       text not null unique,
+     pin_salt   text not null,
+     pin_hash   text not null,
+     is_active  boolean not null default true,
+     created_at timestamptz not null default now()
+   );
+   alter table public.staff_users enable row level security;
+
    -- Lock the tables down. The service_role key used by this server-side app
    -- bypasses RLS, while the public anon key gets no access at all.
    alter table public.assets          enable row level security;
@@ -81,9 +92,12 @@ SETUP
    Community Cloud is HTTPS by default.
 """
 
+import hashlib
 import hmac
 import io
 import re
+import secrets as pysecrets
+import time
 from datetime import date, datetime
 from urllib.parse import parse_qs, urlparse
 from xml.sax.saxutils import escape
@@ -150,6 +164,13 @@ STATUSES = ["Active", "Repair", "Damaged", "Disposed"]
 
 # Status assigned automatically when a new asset is registered
 CONDITION_TO_STATUS = {"Good": "Active", "Fair": "Active", "Needs Repair": "Repair", "Broken": "Damaged"}
+
+# Staff PIN login (for people who arrive by scanning a QR sticker)
+PIN_PATTERN = re.compile(r"^\d{4,8}$")
+PBKDF2_ROUNDS = 120_000
+MAX_PIN_ATTEMPTS = 5          # wrong PINs allowed per browser session ...
+LOCKOUT_SECONDS = 300         # ... then locked for 5 minutes
+STAFF_SESSION_HOURS = 8       # PIN must be re-entered after this long
 
 DEFAULT_PREFIX = "RBL-FURN"
 QR_ID_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9_\-]{2,49}$")
@@ -549,25 +570,136 @@ def show_asset_flow(code: str, inspector: str) -> None:
         render_register_form(code, inspector)
 
 
+# ---- Staff PIN helpers -------------------------------------------------------
+def hash_pin(pin: str, salt_hex: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt_hex), PBKDF2_ROUNDS).hex()
+
+
+def new_pin_record(pin: str) -> dict:
+    salt = pysecrets.token_hex(16)
+    return {"pin_salt": salt, "pin_hash": hash_pin(pin, salt)}
+
+
+def pin_belongs_to(pin: str, row: dict) -> bool:
+    return hmac.compare_digest(hash_pin(pin, row["pin_salt"]), row["pin_hash"])
+
+
+def find_staff_by_pin(pin: str) -> dict | None:
+    rows = get_supabase().table("staff_users").select("*").eq("is_active", True).execute().data or []
+    for row in rows:
+        if pin_belongs_to(pin, row):
+            return row
+    return None
+
+
+def pin_in_use(pin: str, exclude_id: str | None = None) -> bool:
+    rows = get_supabase().table("staff_users").select("*").execute().data or []
+    return any(pin_belongs_to(pin, r) for r in rows if r["id"] != exclude_id)
+
+
+def generate_unique_pin() -> str:
+    while True:
+        pin = str(pysecrets.randbelow(900000) + 100000)  # 6 digits
+        if not pin_in_use(pin):
+            return pin
+
+
+def staff_still_active(staff_id: str) -> bool:
+    """Re-checked on every page run, so disabling someone takes effect immediately."""
+    try:
+        rows = get_supabase().table("staff_users").select("is_active").eq("id", staff_id).limit(1).execute().data
+        return bool(rows and rows[0]["is_active"])
+    except Exception:
+        return False
+
+
+def staff_logout() -> None:
+    for key in ("staff_name", "staff_id", "staff_login_at", "field_code", "field_done", "field_scanning"):
+        st.session_state.pop(key, None)
+
+
+def staff_login() -> str | None:
+    """Returns the staff member's name once a valid PIN has been entered, else shows the PIN form."""
+    ss = st.session_state
+    if ss.get("staff_name"):
+        fresh = time.time() - ss.get("staff_login_at", 0) < STAFF_SESSION_HOURS * 3600
+        if fresh and staff_still_active(ss["staff_id"]):
+            return ss["staff_name"]
+        staff_logout()
+        st.warning("Your session ended. Please enter your PIN again.")
+
+    remaining = ss.get("pin_locked_until", 0) - time.time()
+    if remaining > 0:
+        st.error(f"Too many wrong attempts. Try again in {int(remaining // 60) + 1} minute(s).")
+        return None
+
+    st.subheader("🔑 Enter your PIN")
+    st.caption("Ask your admin if you don't have a PIN yet.")
+    with st.form("pin_form"):
+        pin = st.text_input("PIN", type="password", max_chars=8)
+        go = st.form_submit_button("Continue", type="primary")
+    if go:
+        pin = pin.strip()
+        try:
+            staff = find_staff_by_pin(pin) if PIN_PATTERN.match(pin) else None
+        except Exception as exc:
+            st.error(f"Database error: {exc}")
+            return None
+        if staff:
+            ss.update(staff_name=staff["name"], staff_id=staff["id"], staff_login_at=time.time(), pin_failures=0)
+            st.rerun()
+        ss["pin_failures"] = ss.get("pin_failures", 0) + 1
+        if ss["pin_failures"] >= MAX_PIN_ATTEMPTS:
+            ss["pin_locked_until"] = time.time() + LOCKOUT_SECONDS
+            ss["pin_failures"] = 0
+            st.error("Too many wrong attempts. Locked for 5 minutes.")
+        else:
+            st.error(f"Wrong PIN. {MAX_PIN_ATTEMPTS - ss['pin_failures']} attempt(s) left.")
+    return None
+
+
+def start_field_scan() -> None:
+    st.session_state["field_scanning"] = True
+
+
 def page_field(raw_code: str) -> None:
-    """Staff view opened from a QR link: ONLY the form for that one item, nothing else."""
+    """Staff view opened from a QR link: PIN first, then ONLY the form for that item."""
+    ss = st.session_state
     st.title("🪑 Furniture Check")
-    if st.session_state.get("field_done"):
-        st.success(st.session_state["field_done"])
-        st.info("Done! To record another item, scan its QR code with your phone camera.")
+
+    staff_name = staff_login()
+    if not staff_name:
+        return  # nothing from the database is shown before a valid PIN
+
+    left, right = st.columns([3, 1])
+    left.caption(f"Logged in as **{staff_name}**")
+    if right.button("Log out"):
+        staff_logout()
+        st.rerun()
+
+    # After saving: offer to scan the next sticker without typing the PIN again
+    if ss.get("field_done"):
+        st.success(ss["field_done"])
+        if not ss.get("field_scanning"):
+            st.button("📷 Scan next item", on_click=start_field_scan, type="primary")
+            return
+        scanned = qrcode_scanner(key=f"field_scanner_{ss['scan_nonce']}")
+        if scanned:
+            new_code = extract_code(scanned)
+            if QR_ID_PATTERN.match(new_code):
+                ss.update(field_code=new_code, field_scanning=False)
+                ss.pop("field_done", None)
+                ss["scan_nonce"] += 1
+                st.rerun()
+            st.error("That is not a valid QR code. Please try again.")
         return
 
-    code = extract_code(raw_code)
+    code = ss.get("field_code") or extract_code(raw_code)
     if not QR_ID_PATTERN.match(code):
         st.error("This QR code is not valid.")
         return
-
-    inspector = st.text_input("Your name", key="inspector", placeholder="Type your name and press Enter")
-    if not inspector.strip():
-        st.warning("Please enter your name to continue.")
-        return
     st.caption(f"Scanned item: **{code}**")
-    show_asset_flow(code, inspector)
+    show_asset_flow(code, staff_name)
 
 
 def page_scan(inspector: str) -> None:
@@ -739,6 +871,84 @@ def page_inventory() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Admin page - Staff & PINs
+# --------------------------------------------------------------------------- #
+def page_staff() -> None:
+    st.header("👥 Staff & PINs")
+    st.caption(
+        "Only people with an active PIN can open the QR forms. PINs are stored scrambled (hashed), "
+        "so they cannot be viewed later - use **Reset PIN** if someone forgets theirs."
+    )
+    sb = get_supabase()
+    if st.session_state.get("staff_flash"):
+        st.success(st.session_state.pop("staff_flash"))
+
+    # ---- Add ----
+    with st.form("add_staff", clear_on_submit=True):
+        st.subheader("Add staff member")
+        name = st.text_input("Name")
+        pin = st.text_input("PIN (4-8 digits) - leave blank to auto-generate a 6-digit PIN")
+        add = st.form_submit_button("➕ Add", type="primary")
+    if add:
+        name, pin = name.strip(), pin.strip()
+        if not name:
+            st.error("Please enter a name.")
+        elif pin and not PIN_PATTERN.match(pin):
+            st.error("PIN must be 4 to 8 digits.")
+        elif pin and pin_in_use(pin):
+            st.error("That PIN is already used by someone else. Choose another or leave it blank.")
+        else:
+            pin = pin or generate_unique_pin()
+            try:
+                sb.table("staff_users").insert({"name": name, **new_pin_record(pin)}).execute()
+            except Exception as exc:
+                st.error(f"Could not add (is the name already taken?): {exc}")
+            else:
+                st.session_state["staff_flash"] = f"✅ {name} added. PIN: {pin}  - note it down now, it cannot be shown again."
+                st.rerun()
+
+    # ---- List ----
+    rows = sb.table("staff_users").select("*").order("name").execute().data or []
+    if not rows:
+        st.info("No staff yet. Add the first person above.")
+        return
+    table = pd.DataFrame(rows)
+    table["Status"] = table["is_active"].map({True: "Active", False: "Disabled"})
+    table["Added"] = pd.to_datetime(table["created_at"], utc=True).dt.tz_localize(None).dt.strftime("%Y-%m-%d")
+    st.dataframe(table[["name", "Status", "Added"]].rename(columns={"name": "Name"}), hide_index=True)
+
+    # ---- Manage ----
+    st.subheader("Manage a staff member")
+    chosen = st.selectbox("Select", [r["name"] for r in rows])
+    person = next(r for r in rows if r["name"] == chosen)
+
+    new_pin = st.text_input("New PIN (4-8 digits) - leave blank to auto-generate", key="reset_pin_input")
+    if st.button("🔑 Reset PIN"):
+        new_pin = new_pin.strip()
+        if new_pin and not PIN_PATTERN.match(new_pin):
+            st.error("PIN must be 4 to 8 digits.")
+        elif new_pin and pin_in_use(new_pin, exclude_id=person["id"]):
+            st.error("That PIN is already used by someone else.")
+        else:
+            new_pin = new_pin or generate_unique_pin()
+            sb.table("staff_users").update(new_pin_record(new_pin)).eq("id", person["id"]).execute()
+            st.session_state["staff_flash"] = f"✅ New PIN for {chosen}: {new_pin}  - note it down now."
+            st.rerun()
+
+    c1, c2 = st.columns(2)
+    if c1.button("⏸ Disable" if person["is_active"] else "▶ Enable"):
+        sb.table("staff_users").update({"is_active": not person["is_active"]}).eq("id", person["id"]).execute()
+        st.session_state["staff_flash"] = f"{chosen} is now {'disabled' if person['is_active'] else 'active'}."
+        st.rerun()
+    confirm = c2.checkbox(f"Confirm: permanently delete {chosen}")
+    if c2.button("🗑 Delete", disabled=not confirm):
+        sb.table("staff_users").delete().eq("id", person["id"]).execute()
+        st.session_state["staff_flash"] = f"{chosen} deleted."
+        st.rerun()
+    st.caption("Past inspection logs keep the person's name even after they are disabled or deleted.")
+
+
+# --------------------------------------------------------------------------- #
 # PAGE 3 - QR code generator (admin only)
 # --------------------------------------------------------------------------- #
 def admin_gate() -> bool:
@@ -899,7 +1109,7 @@ def main() -> None:
     st.sidebar.title("🪑 Furniture Tracker")
     page = st.sidebar.radio(
         "Navigate",
-        ["Inventory & Dashboard", "QR Code Generator", "Scan & Register / Update"],
+        ["Inventory & Dashboard", "QR Code Generator", "Staff & PINs", "Scan & Register / Update"],
     )
     inspector = st.sidebar.text_input("Inspector name", key="inspector", placeholder="Your name")
     if st.sidebar.button("🔒 Log out"):
@@ -911,6 +1121,8 @@ def main() -> None:
         page_scan(inspector)
     elif page == "Inventory & Dashboard":
         page_inventory()
+    elif page == "Staff & PINs":
+        page_staff()
     else:
         page_qr_generator()
 
