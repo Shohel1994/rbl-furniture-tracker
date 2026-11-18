@@ -5,7 +5,7 @@ Furniture Asset Tracker  -  Streamlit + Supabase + pre-printed blank QR codes
 SETUP
 -----
 1) requirements.txt
-       streamlit>=1.35
+       streamlit>=1.37
        supabase>=2.4
        streamlit-qrcode-scanner>=0.1.2
        pandas>=2.0
@@ -57,14 +57,15 @@ SETUP
    create index if not exists idx_logs_qr_time
      on public.inspection_logs (qr_code_id, "timestamp" desc);
 
-   -- Staff PINs (managed from the admin page 'Staff & PINs'; PINs are stored hashed)
+   -- Staff login = name + Employee ID (managed in the admin page 'Staff & Employee IDs')
+   -- (If you already created staff_users in the earlier PIN version, first run:
+   --    drop table if exists public.staff_users;  )
    create table if not exists public.staff_users (
-     id         uuid primary key default gen_random_uuid(),
-     name       text not null unique,
-     pin_salt   text not null,
-     pin_hash   text not null,
-     is_active  boolean not null default true,
-     created_at timestamptz not null default now()
+     id          uuid primary key default gen_random_uuid(),
+     name        text not null unique,
+     employee_id text not null unique,
+     is_active   boolean not null default true,
+     created_at  timestamptz not null default now()
    );
    alter table public.staff_users enable row level security;
 
@@ -96,7 +97,6 @@ import hashlib
 import hmac
 import io
 import re
-import secrets as pysecrets
 import time
 from datetime import date, datetime
 from urllib.parse import parse_qs, urlparse
@@ -105,6 +105,7 @@ from xml.sax.saxutils import escape
 import pandas as pd
 import qrcode
 import streamlit as st
+import streamlit.components.v1 as components
 from qrcode.constants import ERROR_CORRECT_M
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
@@ -165,12 +166,12 @@ STATUSES = ["Active", "Repair", "Damaged", "Disposed"]
 # Status assigned automatically when a new asset is registered
 CONDITION_TO_STATUS = {"Good": "Active", "Fair": "Active", "Needs Repair": "Repair", "Broken": "Damaged"}
 
-# Staff PIN login (for people who arrive by scanning a QR sticker)
-PIN_PATTERN = re.compile(r"^\d{4,8}$")
-PBKDF2_ROUNDS = 120_000
-MAX_PIN_ATTEMPTS = 5          # wrong PINs allowed per browser session ...
+# Staff login (for people who arrive by scanning a QR sticker): Employee ID = password
+ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-]{3,20}$")
+MAX_LOGIN_ATTEMPTS = 5        # wrong IDs allowed per browser session ...
 LOCKOUT_SECONDS = 300         # ... then locked for 5 minutes
-STAFF_SESSION_HOURS = 8       # PIN must be re-entered after this long
+REMEMBER_DAYS = 30            # a device stays logged in for this long
+COOKIE_NAME = "rbl_staff"
 
 DEFAULT_PREFIX = "RBL-FURN"
 QR_ID_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9_\-]{2,49}$")
@@ -570,91 +571,149 @@ def show_asset_flow(code: str, inspector: str) -> None:
         render_register_form(code, inspector)
 
 
-# ---- Staff PIN helpers -------------------------------------------------------
-def hash_pin(pin: str, salt_hex: str) -> str:
-    return hashlib.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt_hex), PBKDF2_ROUNDS).hex()
-
-
-def new_pin_record(pin: str) -> dict:
-    salt = pysecrets.token_hex(16)
-    return {"pin_salt": salt, "pin_hash": hash_pin(pin, salt)}
-
-
-def pin_belongs_to(pin: str, row: dict) -> bool:
-    return hmac.compare_digest(hash_pin(pin, row["pin_salt"]), row["pin_hash"])
-
-
-def find_staff_by_pin(pin: str) -> dict | None:
-    rows = get_supabase().table("staff_users").select("*").eq("is_active", True).execute().data or []
-    for row in rows:
-        if pin_belongs_to(pin, row):
-            return row
-    return None
-
-
-def pin_in_use(pin: str, exclude_id: str | None = None) -> bool:
-    rows = get_supabase().table("staff_users").select("*").execute().data or []
-    return any(pin_belongs_to(pin, r) for r in rows if r["id"] != exclude_id)
-
-
-def generate_unique_pin() -> str:
-    while True:
-        pin = str(pysecrets.randbelow(900000) + 100000)  # 6 digits
-        if not pin_in_use(pin):
-            return pin
-
-
-def staff_still_active(staff_id: str) -> bool:
-    """Re-checked on every page run, so disabling someone takes effect immediately."""
+# ---- Staff login helpers ------------------------------------------------------
+def _cookie_key() -> bytes:
+    """Secret used to sign the 'remember this device' cookie (optional [app] cookie_secret)."""
     try:
-        rows = get_supabase().table("staff_users").select("is_active").eq("id", staff_id).limit(1).execute().data
-        return bool(rows and rows[0]["is_active"])
+        base = str(st.secrets["app"]["cookie_secret"])
+    except Exception:
+        base = str(st.secrets["supabase"]["key"])
+    return hashlib.sha256(("rbl-staff-cookie|" + base).encode()).digest()
+
+
+def _sign(staff_id: str, exp: int, employee_id: str) -> str:
+    msg = f"{staff_id}.{exp}.{employee_id}".encode()
+    return hmac.new(_cookie_key(), msg, hashlib.sha256).hexdigest()
+
+
+def make_remember_token(row: dict) -> str:
+    exp = int(time.time()) + REMEMBER_DAYS * 86400
+    return f"{row['id']}.{exp}.{_sign(row['id'], exp, row['employee_id'])}"
+
+
+def staff_from_token(token: str) -> dict | None:
+    """Valid only if signed by us, not expired, person still active and Employee ID unchanged."""
+    try:
+        staff_id, exp, sig = token.split(".")
+        if int(exp) < time.time():
+            return None
+        rows = (
+            get_supabase().table("staff_users").select("*")
+            .eq("id", staff_id).eq("is_active", True).limit(1).execute().data
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return row if hmac.compare_digest(_sign(staff_id, int(exp), row["employee_id"]), sig) else None
+    except Exception:
+        return None
+
+
+def cookie_script(value: str, max_age: int) -> None:
+    """Set (or clear, with max_age=0) the remember-me cookie in the browser."""
+    components.html(
+        f"""<script>
+        (function () {{
+          var d = document;
+          try {{ d = window.parent.document; }} catch (e) {{}}
+          var secure = (window.location.protocol === 'https:') ? '; Secure' : '';
+          d.cookie = '{COOKIE_NAME}={value}; Max-Age={max_age}; Path=/; SameSite=Lax' + secure;
+        }})();
+        </script>""",
+        height=0,
+    )
+
+
+def read_remember_cookie() -> str | None:
+    try:
+        return st.context.cookies.get(COOKIE_NAME)
+    except Exception:
+        return None
+
+
+def find_staff_by_employee_id(employee_id: str) -> dict | None:
+    rows = (
+        get_supabase().table("staff_users").select("*")
+        .eq("employee_id", employee_id).eq("is_active", True).limit(1).execute().data
+    )
+    return rows[0] if rows else None
+
+
+def staff_still_active(staff_id: str, employee_id: str) -> bool:
+    """Re-checked on every run: disabling/deleting someone or changing their ID logs them out."""
+    try:
+        rows = (
+            get_supabase().table("staff_users").select("is_active,employee_id")
+            .eq("id", staff_id).limit(1).execute().data
+        )
+        return bool(rows and rows[0]["is_active"] and rows[0]["employee_id"] == employee_id)
     except Exception:
         return False
 
 
 def staff_logout() -> None:
-    for key in ("staff_name", "staff_id", "staff_login_at", "field_code", "field_done", "field_scanning"):
+    for key in ("staff_name", "staff_id", "staff_eid", "field_code", "field_done", "field_scanning", "cookie_to_set"):
         st.session_state.pop(key, None)
+    st.session_state["logged_out"] = True   # don't auto-login from the old cookie
+    st.session_state["cookie_clear"] = True  # and wipe the cookie from this device
 
 
 def staff_login() -> str | None:
-    """Returns the staff member's name once a valid PIN has been entered, else shows the PIN form."""
+    """Returns the staff member's name when logged in (session or remembered device), else shows the login form."""
     ss = st.session_state
+
+    # 1) Already logged in during this browser session
     if ss.get("staff_name"):
-        fresh = time.time() - ss.get("staff_login_at", 0) < STAFF_SESSION_HOURS * 3600
-        if fresh and staff_still_active(ss["staff_id"]):
+        if staff_still_active(ss["staff_id"], ss["staff_eid"]):
+            if ss.get("cookie_to_set"):  # first run after a fresh login: remember this device
+                cookie_script(ss.pop("cookie_to_set"), REMEMBER_DAYS * 86400)
             return ss["staff_name"]
         staff_logout()
-        st.warning("Your session ended. Please enter your PIN again.")
+        st.warning("Your access was removed or changed. Please log in again.")
 
-    remaining = ss.get("pin_locked_until", 0) - time.time()
+    if ss.pop("cookie_clear", False):
+        cookie_script("", 0)
+
+    # 2) This device remembers the person (cookie sent with the page request)
+    token = read_remember_cookie()
+    if token and not ss.get("logged_out"):
+        row = staff_from_token(token)
+        if row:
+            ss.update(staff_name=row["name"], staff_id=row["id"], staff_eid=row["employee_id"])
+            return row["name"]
+
+    # 3) Ask for the Employee ID
+    remaining = ss.get("login_locked_until", 0) - time.time()
     if remaining > 0:
         st.error(f"Too many wrong attempts. Try again in {int(remaining // 60) + 1} minute(s).")
         return None
 
-    st.subheader("🔑 Enter your PIN")
-    st.caption("Ask your admin if you don't have a PIN yet.")
-    with st.form("pin_form"):
-        pin = st.text_input("PIN", type="password", max_chars=8)
-        go = st.form_submit_button("Continue", type="primary")
+    st.subheader("🔑 Log in")
+    st.caption(f"Enter your Employee ID. This device will remember you for {REMEMBER_DAYS} days.")
+    with st.form("login_form"):
+        eid = st.text_input("Employee ID", type="password", max_chars=20)
+        go = st.form_submit_button("Log in", type="primary")
     if go:
-        pin = pin.strip()
+        eid = eid.strip()
         try:
-            staff = find_staff_by_pin(pin) if PIN_PATTERN.match(pin) else None
+            row = find_staff_by_employee_id(eid) if ID_PATTERN.match(eid) else None
         except Exception as exc:
             st.error(f"Database error: {exc}")
             return None
-        if staff:
-            ss.update(staff_name=staff["name"], staff_id=staff["id"], staff_login_at=time.time(), pin_failures=0)
+        if row:
+            ss.update(
+                staff_name=row["name"], staff_id=row["id"], staff_eid=row["employee_id"],
+                cookie_to_set=make_remember_token(row), login_failures=0,
+            )
+            ss.pop("logged_out", None)
             st.rerun()
-        ss["pin_failures"] = ss.get("pin_failures", 0) + 1
-        if ss["pin_failures"] >= MAX_PIN_ATTEMPTS:
-            ss["pin_locked_until"] = time.time() + LOCKOUT_SECONDS
-            ss["pin_failures"] = 0
+        ss["login_failures"] = ss.get("login_failures", 0) + 1
+        if ss["login_failures"] >= MAX_LOGIN_ATTEMPTS:
+            ss["login_locked_until"] = time.time() + LOCKOUT_SECONDS
+            ss["login_failures"] = 0
             st.error("Too many wrong attempts. Locked for 5 minutes.")
         else:
-            st.error(f"Wrong PIN. {MAX_PIN_ATTEMPTS - ss['pin_failures']} attempt(s) left.")
+            st.error(f"Wrong Employee ID. {MAX_LOGIN_ATTEMPTS - ss['login_failures']} attempt(s) left.")
     return None
 
 
@@ -663,13 +722,13 @@ def start_field_scan() -> None:
 
 
 def page_field(raw_code: str) -> None:
-    """Staff view opened from a QR link: PIN first, then ONLY the form for that item."""
+    """Staff view opened from a QR link: login first, then ONLY the form for that item."""
     ss = st.session_state
     st.title("🪑 Furniture Check")
 
     staff_name = staff_login()
     if not staff_name:
-        return  # nothing from the database is shown before a valid PIN
+        return  # nothing from the database is shown before a valid login
 
     left, right = st.columns([3, 1])
     left.caption(f"Logged in as **{staff_name}**")
@@ -677,7 +736,7 @@ def page_field(raw_code: str) -> None:
         staff_logout()
         st.rerun()
 
-    # After saving: offer to scan the next sticker without typing the PIN again
+    # After saving: offer to scan the next sticker inside the page
     if ss.get("field_done"):
         st.success(ss["field_done"])
         if not ss.get("field_scanning"):
@@ -871,80 +930,137 @@ def page_inventory() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Admin page - Staff & PINs
+# Admin page - Staff & Employee IDs
 # --------------------------------------------------------------------------- #
+def parse_staff_lines(text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Lines like 'Md. Liton Ali<TAB>170600002' -> (name, employee_id); the last word is the ID."""
+    entries, bad = [], []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.replace("\t", " ").rsplit(None, 1)
+        if len(parts) == 2 and ID_PATTERN.match(parts[1]):
+            entries.append((parts[0].strip(), parts[1]))
+        else:
+            bad.append(line)
+    return entries, bad
+
+
 def page_staff() -> None:
-    st.header("👥 Staff & PINs")
+    st.header("👥 Staff & Employee IDs")
     st.caption(
-        "Only people with an active PIN can open the QR forms. PINs are stored scrambled (hashed), "
-        "so they cannot be viewed later - use **Reset PIN** if someone forgets theirs."
+        "Staff log in with their **Employee ID** (it works as their password) after scanning a QR. "
+        "Edit the chart below like a spreadsheet: change a cell, add a row at the bottom, or select a row "
+        "and press Delete - then click **Save changes**. Disabling, deleting or changing someone's ID "
+        "logs them out of every device immediately."
     )
     sb = get_supabase()
-    if st.session_state.get("staff_flash"):
-        st.success(st.session_state.pop("staff_flash"))
+    ss = st.session_state
+    ss.setdefault("staff_editor_ver", 0)
+    if ss.get("staff_flash"):
+        st.success(ss.pop("staff_flash"))
 
-    # ---- Add ----
-    with st.form("add_staff", clear_on_submit=True):
-        st.subheader("Add staff member")
-        name = st.text_input("Name")
-        pin = st.text_input("PIN (4-8 digits) - leave blank to auto-generate a 6-digit PIN")
-        add = st.form_submit_button("➕ Add", type="primary")
-    if add:
-        name, pin = name.strip(), pin.strip()
-        if not name:
-            st.error("Please enter a name.")
-        elif pin and not PIN_PATTERN.match(pin):
-            st.error("PIN must be 4 to 8 digits.")
-        elif pin and pin_in_use(pin):
-            st.error("That PIN is already used by someone else. Choose another or leave it blank.")
-        else:
-            pin = pin or generate_unique_pin()
-            try:
-                sb.table("staff_users").insert({"name": name, **new_pin_record(pin)}).execute()
-            except Exception as exc:
-                st.error(f"Could not add (is the name already taken?): {exc}")
-            else:
-                st.session_state["staff_flash"] = f"✅ {name} added. PIN: {pin}  - note it down now, it cannot be shown again."
-                st.rerun()
-
-    # ---- List ----
     rows = sb.table("staff_users").select("*").order("name").execute().data or []
-    if not rows:
-        st.info("No staff yet. Add the first person above.")
-        return
-    table = pd.DataFrame(rows)
-    table["Status"] = table["is_active"].map({True: "Active", False: "Disabled"})
-    table["Added"] = pd.to_datetime(table["created_at"], utc=True).dt.tz_localize(None).dt.strftime("%Y-%m-%d")
-    st.dataframe(table[["name", "Status", "Added"]].rename(columns={"name": "Name"}), hide_index=True)
+    orig = pd.DataFrame(rows, columns=["id", "name", "employee_id", "is_active"])
+    orig["is_active"] = orig["is_active"].astype(bool)
 
-    # ---- Manage ----
-    st.subheader("Manage a staff member")
-    chosen = st.selectbox("Select", [r["name"] for r in rows])
-    person = next(r for r in rows if r["name"] == chosen)
+    # ---- Editable chart (add / edit / delete) ----
+    edited = st.data_editor(
+        orig, num_rows="dynamic", hide_index=True, disabled=["id"],
+        key=f"staff_editor_{ss['staff_editor_ver']}",
+        column_config={
+            "id": None,
+            "name": st.column_config.TextColumn("Name", required=True),
+            "employee_id": st.column_config.TextColumn("Employee ID (password)", required=True),
+            "is_active": st.column_config.CheckboxColumn("Active", default=True),
+        },
+    )
 
-    new_pin = st.text_input("New PIN (4-8 digits) - leave blank to auto-generate", key="reset_pin_input")
-    if st.button("🔑 Reset PIN"):
-        new_pin = new_pin.strip()
-        if new_pin and not PIN_PATTERN.match(new_pin):
-            st.error("PIN must be 4 to 8 digits.")
-        elif new_pin and pin_in_use(new_pin, exclude_id=person["id"]):
-            st.error("That PIN is already used by someone else.")
-        else:
-            new_pin = new_pin or generate_unique_pin()
-            sb.table("staff_users").update(new_pin_record(new_pin)).eq("id", person["id"]).execute()
-            st.session_state["staff_flash"] = f"✅ New PIN for {chosen}: {new_pin}  - note it down now."
-            st.rerun()
+    kept_ids = set(edited["id"].dropna())
+    deleted = orig[~orig["id"].isin(kept_ids)]
+    confirm = True
+    if len(deleted):
+        st.warning("These people will be deleted: " + ", ".join(deleted["name"]))
+        confirm = st.checkbox("Yes, delete them")
 
-    c1, c2 = st.columns(2)
-    if c1.button("⏸ Disable" if person["is_active"] else "▶ Enable"):
-        sb.table("staff_users").update({"is_active": not person["is_active"]}).eq("id", person["id"]).execute()
-        st.session_state["staff_flash"] = f"{chosen} is now {'disabled' if person['is_active'] else 'active'}."
+    if st.button("💾 Save changes", type="primary", disabled=not confirm):
+        final = edited.copy()
+        final["name"] = final["name"].fillna("").astype(str).str.strip()
+        final["employee_id"] = final["employee_id"].fillna("").astype(str).str.strip()
+        final["is_active"] = final["is_active"].fillna(True).astype(bool)
+
+        errors = []
+        if (final["name"] == "").any():
+            errors.append("Every row needs a name.")
+        bad_ids = final.loc[~final["employee_id"].apply(lambda v: bool(ID_PATTERN.match(v))), "name"]
+        if len(bad_ids):
+            errors.append("Invalid Employee ID (3-20 letters/digits) for: " + ", ".join(bad_ids))
+        if final["name"].duplicated().any():
+            errors.append("Two rows have the same name.")
+        if final["employee_id"].duplicated().any():
+            errors.append("Two rows have the same Employee ID.")
+        if errors:
+            for msg in errors:
+                st.error(msg)
+            return
+
+        try:
+            for sid in deleted["id"]:
+                sb.table("staff_users").delete().eq("id", sid).execute()
+            orig_by_id = orig.set_index("id")
+            added = changed = 0
+            for _, r in final.iterrows():
+                payload = {"name": r["name"], "employee_id": r["employee_id"], "is_active": bool(r["is_active"])}
+                if pd.isna(r["id"]):
+                    sb.table("staff_users").insert(payload).execute()
+                    added += 1
+                else:
+                    o = orig_by_id.loc[r["id"]]
+                    if (o["name"], o["employee_id"], bool(o["is_active"])) != tuple(payload.values()):
+                        sb.table("staff_users").update(payload).eq("id", r["id"]).execute()
+                        changed += 1
+        except Exception as exc:
+            st.error(f"Could not save everything: {exc}")
+            return
+        ss["staff_editor_ver"] += 1  # reset the editor so it reloads fresh data
+        ss["staff_flash"] = f"✅ Saved: {added} added, {changed} updated, {len(deleted)} deleted."
         st.rerun()
-    confirm = c2.checkbox(f"Confirm: permanently delete {chosen}")
-    if c2.button("🗑 Delete", disabled=not confirm):
-        sb.table("staff_users").delete().eq("id", person["id"]).execute()
-        st.session_state["staff_flash"] = f"{chosen} deleted."
-        st.rerun()
+
+    # ---- Bulk add by pasting a list ----
+    with st.expander("📋 Add many people at once (paste a list)"):
+        st.caption("One person per line: the name, then the Employee ID at the end (tab or space between).")
+        pasted = st.text_area("List", height=160, placeholder="Md. Liton Ali    170600002\nMd. Shohel Rana    220808312")
+        if st.button("➕ Add all from list"):
+            entries, bad = parse_staff_lines(pasted)
+            have_names = {n.lower() for n in orig["name"]}
+            have_ids = set(orig["employee_id"])
+            new_rows, skipped = [], []
+            for name, eid in entries:
+                if name.lower() in have_names or eid in have_ids:
+                    skipped.append(name)
+                else:
+                    new_rows.append({"name": name, "employee_id": eid})
+                    have_names.add(name.lower())
+                    have_ids.add(eid)
+            if bad:
+                st.error("Could not read these lines: " + " | ".join(bad))
+            elif not entries:
+                st.error("Nothing to add.")
+            else:
+                try:
+                    if new_rows:
+                        sb.table("staff_users").insert(new_rows).execute()
+                except Exception as exc:
+                    st.error(f"Could not add: {exc}")
+                else:
+                    msg = f"✅ Added {len(new_rows)} people."
+                    if skipped:
+                        msg += f" Skipped (already exist): {', '.join(skipped)}."
+                    ss["staff_editor_ver"] += 1
+                    ss["staff_flash"] = msg
+                    st.rerun()
+
     st.caption("Past inspection logs keep the person's name even after they are disabled or deleted.")
 
 
@@ -1109,7 +1225,7 @@ def main() -> None:
     st.sidebar.title("🪑 Furniture Tracker")
     page = st.sidebar.radio(
         "Navigate",
-        ["Inventory & Dashboard", "QR Code Generator", "Staff & PINs", "Scan & Register / Update"],
+        ["Inventory & Dashboard", "QR Code Generator", "Staff & Employee IDs", "Scan & Register / Update"],
     )
     inspector = st.sidebar.text_input("Inspector name", key="inspector", placeholder="Your name")
     if st.sidebar.button("🔒 Log out"):
@@ -1121,7 +1237,7 @@ def main() -> None:
         page_scan(inspector)
     elif page == "Inventory & Dashboard":
         page_inventory()
-    elif page == "Staff & PINs":
+    elif page == "Staff & Employee IDs":
         page_staff()
     else:
         page_qr_generator()
