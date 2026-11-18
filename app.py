@@ -26,8 +26,20 @@ SETUP
      purchase_date date,
      status        text not null default 'Active'
                    check (status in ('Active','Repair','Damaged','Disposed')),
+     colour           text,
+     size_measurement text,
+     special_feature  text,
+     model_details    text,
      created_at    timestamptz not null default now()
    );
+
+   -- Tables already exist from an earlier version? Don't drop them, just add the
+   -- new product-detail columns (safe to run more than once):
+   alter table public.assets
+     add column if not exists colour           text,
+     add column if not exists size_measurement text,
+     add column if not exists special_feature  text,
+     add column if not exists model_details    text;
 
    create table if not exists public.inspection_logs (
      log_id           bigint generated always as identity primary key,
@@ -103,7 +115,32 @@ st.set_page_config(
 # --------------------------------------------------------------------------- #
 # Configuration - edit these lists to match your factory / office
 # --------------------------------------------------------------------------- #
-CATEGORIES = ["Chair", "Table", "Desk", "Locker", "Cabinet", "Rack", "Bench", "Sofa", "Other"]
+CATEGORIES = [
+    "Chair",
+    "Table",
+    "Cabinet",
+    "Almira",
+    "Locker",
+    "Desk",
+    "Tool & Step",
+    "Sofa Set",
+    "Bed",
+    "Shelf & Rack",
+    "Basket & Bin",
+    "Other",
+]
+COLOURS = [
+    "Not specified", "White", "Black", "Brown", "Grey", "Blue", "Green",
+    "Red", "Beige", "Wooden", "Metallic", "Other",
+]
+# Product-detail columns stored on the assets table (all optional)
+DETAIL_LABELS = {
+    "colour": "Colour",
+    "size_measurement": "Size / Measurement",
+    "special_feature": "Special feature",
+    "model_details": "Model / other details",
+}
+DETAIL_COLS = list(DETAIL_LABELS)
 LOCATIONS = [
     "Admin Floor 1", "Admin Floor 2", "Production Floor 1", "Production Floor 2",
     "Store Room", "Canteen", "Other",
@@ -173,7 +210,8 @@ def fetch_all(table: str, order_col: str) -> list[dict]:
 
 
 INVENTORY_COLS = [
-    "qr_code_id", "category", "location", "assigned_user", "purchase_date",
+    "qr_code_id", "category", "colour", "size_measurement", "special_feature",
+    "model_details", "location", "assigned_user", "purchase_date",
     "status", "condition", "quantity", "checked_by", "last_checked",
 ]
 DISPLAY_NAMES = {
@@ -181,6 +219,9 @@ DISPLAY_NAMES = {
     "assigned_user": "Assigned User", "purchase_date": "Purchase Date",
     "status": "Status", "condition": "Condition", "quantity": "Qty",
     "checked_by": "Last Checked By", "last_checked": "Last Checked",
+    "colour": "Colour", "size_measurement": "Size / Measurement",
+    "special_feature": "Special Feature", "model_details": "Model / Details",
+    "details": "Details",
 }
 
 
@@ -190,6 +231,10 @@ def load_inventory() -> pd.DataFrame:
     assets = pd.DataFrame(fetch_all("assets", "created_at"))
     if assets.empty:
         return pd.DataFrame(columns=INVENTORY_COLS)
+
+    for col in DETAIL_COLS:  # tolerate rows / databases without the detail columns
+        if col not in assets.columns:
+            assets[col] = None
 
     logs = pd.DataFrame(fetch_all("inspection_logs", "timestamp"))
     if logs.empty:
@@ -272,6 +317,48 @@ def set_active_code(raw: str) -> None:
 # --------------------------------------------------------------------------- #
 # PAGE 1 - Scan & Register / Update
 # --------------------------------------------------------------------------- #
+def details_text(row) -> str:
+    """One readable line, e.g. 'Size: W=24'' L=45'' | Colour: White' (row = dict or Series)."""
+    parts = []
+    for key, label in (("size_measurement", "Size"), ("colour", "Colour"),
+                       ("special_feature", "Feature"), ("model_details", "Model")):
+        value = row.get(key)
+        if value is not None and not pd.isna(value) and str(value).strip():
+            parts.append(f"{label}: {value}")
+    return " | ".join(parts)
+
+
+def detail_inputs(current: dict | None = None) -> dict:
+    """Product-detail widgets (use inside a form). Returns the values ready for Supabase."""
+    d = current or {}
+    colour_opts = with_current(COLOURS, d.get("colour"))
+    colour_now = d.get("colour") or COLOURS[0]
+    st.markdown("**Product details**")
+    colour = st.selectbox("Colour", colour_opts, index=colour_opts.index(colour_now))
+    colour_custom = st.text_input("Custom colour (only if you chose 'Other')")
+    size = st.text_input(
+        "Size / Measurement", value=d.get("size_measurement") or "",
+        placeholder="e.g. W=24'', L=45'', H=30''",
+    )
+    feature = st.text_input(
+        "Special feature", value=d.get("special_feature") or "",
+        placeholder="e.g. with wheels, adjustable height, lockable",
+    )
+    model = st.text_input(
+        "Model / other details", value=d.get("model_details") or "",
+        placeholder="e.g. Model X-200, 3-drawer",
+    )
+    colour_final = resolve_choice(colour, colour_custom)
+    if colour_final == "Not specified":
+        colour_final = ""
+    return {
+        "colour": colour_final or None,
+        "size_measurement": size.strip() or None,
+        "special_feature": feature.strip() or None,
+        "model_details": model.strip() or None,
+    }
+
+
 def render_register_form(code: str, inspector: str) -> None:
     sb = get_supabase()
     st.info(f"🆕 **{code}** is not registered yet. Fill in the details to register it.")
@@ -279,6 +366,7 @@ def render_register_form(code: str, inspector: str) -> None:
     with st.form("register_form"):
         category = st.selectbox("Category", CATEGORIES)
         category_custom = st.text_input("Custom category (only if you chose 'Other')")
+        details = detail_inputs()
         location = st.selectbox("Location", LOCATIONS)
         location_custom = st.text_input("Custom location (only if you chose 'Other')")
         assigned_user = st.text_input("Assigned user (employee name)")
@@ -304,6 +392,7 @@ def render_register_form(code: str, inspector: str) -> None:
         sb.table("assets").insert({
             "qr_code_id": code,
             "category": category_final,
+            **details,
             "location": location_final,
             "assigned_user": assigned_user.strip() or None,
             "purchase_date": purchase_date.isoformat() if purchase_date else None,
@@ -351,8 +440,11 @@ def render_update_form(asset: dict, inspector: str) -> None:
     c4.metric("Status", asset["status"])
     c5.metric("Last condition", last.get("condition_status", "—"))
     c6.metric("Purchase date", asset.get("purchase_date") or "—")
+    if details_text(asset):
+        st.caption(f"**Details:** {details_text(asset)}")
 
     location_opts = with_current(LOCATIONS, asset["location"])
+    category_opts = with_current(CATEGORIES, asset["category"])
     cond_default = last.get("condition_status", "Good")
 
     st.subheader("Log inspection / update")
@@ -365,6 +457,9 @@ def render_update_form(asset: dict, inspector: str) -> None:
         location = st.selectbox("Location", location_opts, index=location_opts.index(asset["location"]))
         location_custom = st.text_input("Custom location (only if you chose 'Other')")
         assigned_user = st.text_input("Assigned user", value=asset.get("assigned_user") or "")
+        category = st.selectbox("Category", category_opts, index=category_opts.index(asset["category"]))
+        category_custom = st.text_input("Custom category (only if you chose 'Other')")
+        details = detail_inputs(asset)
         status = st.selectbox("Status", STATUSES, index=STATUSES.index(asset["status"]))
         remarks = st.text_area("Remarks (optional)")
         st.caption(
@@ -380,6 +475,10 @@ def render_update_form(asset: dict, inspector: str) -> None:
         new_location = resolve_choice(location, location_custom)
         if not new_location:
             st.error("Please type the custom location.")
+            return
+        new_category = resolve_choice(category, category_custom)
+        if not new_category:
+            st.error("Please type the custom category.")
             return
 
         # Auto-escalate status for problem conditions
@@ -399,6 +498,13 @@ def render_update_form(asset: dict, inspector: str) -> None:
         if new_status != asset["status"]:
             updates["status"] = new_status
             notes.append(f"Status: {asset['status']} → {new_status}")
+        if new_category != asset["category"]:
+            updates["category"] = new_category
+            notes.append(f"Category: {asset['category']} → {new_category}")
+        changed = [k for k, v in details.items() if v != (asset.get(k) or None)]
+        if changed:
+            updates.update({k: details[k] for k in changed})
+            notes.append("Details updated: " + ", ".join(DETAIL_LABELS[k] for k in changed))
 
         full_remarks = " | ".join(filter(None, [remarks.strip(), "; ".join(notes)])) or None
 
@@ -530,9 +636,11 @@ def build_inventory_pdf(df: pd.DataFrame) -> bytes:
     cell = ParagraphStyle("cell", parent=styles["BodyText"], fontSize=7, leading=9)
     head = ParagraphStyle("head", parent=cell, fontName="Helvetica-Bold", textColor=colors.white)
 
-    cols = ["qr_code_id", "category", "location", "assigned_user", "purchase_date",
-            "status", "condition", "quantity", "last_checked"]
-    widths = [32, 25, 45, 42, 24, 22, 26, 12, 32]  # mm
+    df = df.copy()
+    df["details"] = [details_text(r) for _, r in df.iterrows()]
+    cols = ["qr_code_id", "category", "details", "location", "assigned_user",
+            "purchase_date", "status", "condition", "quantity", "last_checked"]
+    widths = [30, 22, 52, 34, 30, 20, 18, 22, 10, 28]  # mm
     data = [[Paragraph(DISPLAY_NAMES[c], head) for c in cols]]
     for _, row in df.iterrows():
         data.append([Paragraph(escape(_fmt(row[c])), cell) for c in cols])
@@ -581,7 +689,7 @@ def page_inventory() -> None:
     m5.metric("Broken", int((df["condition"] == "Broken").sum()))
 
     # ---- Filters ----------------------------------------------------------------
-    search = st.text_input("🔎 Search (QR ID, user, location, category)")
+    search = st.text_input("🔎 Search (QR ID, user, location, category, colour, size...)")
     f1, f2, f3, f4 = st.columns(4)
     sel_cat = f1.multiselect("Category", sorted(df["category"].dropna().unique()))
     sel_loc = f2.multiselect("Location", sorted(df["location"].dropna().unique()))
@@ -591,7 +699,7 @@ def page_inventory() -> None:
     mask = pd.Series(True, index=df.index)
     if search.strip():
         needle = search.strip().lower()
-        haystack = df[["qr_code_id", "assigned_user", "location", "category"]].fillna("").astype(str)
+        haystack = df[["qr_code_id", "assigned_user", "location", "category", *DETAIL_COLS]].fillna("").astype(str)
         mask &= haystack.apply(lambda col: col.str.lower().str.contains(needle, regex=False)).any(axis=1)
     if sel_cat:
         mask &= df["category"].isin(sel_cat)
